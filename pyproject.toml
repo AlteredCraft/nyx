@@ -1,0 +1,25 @@
+[project]
+name = "nyx"
+version = "0.1.0"
+description = "Time-bounded AI task orchestrator for overnight autonomous execution"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+nyx = "nyx.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nyx"]

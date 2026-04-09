@@ -1,0 +1,48 @@
+# Nyx — Night Shift Orchestrator Configuration
+# Copy to nyx.toml and customize.
+
+[session]
+duration_hours = 6            # Max runtime before graceful shutdown
+max_budget_usd = 50.0         # Total API spend cap for the session
+max_episodes = 24             # Max episode iterations across all tasks
+error_threshold = 10          # Halt after this many total errors
+stop_flag = "~/.nyx/STOP"     # Touch this file to stop after current episode
+episode_timeout_sec = 3600    # Max time per episode (1 hour)
+
+[database]
+path = "~/.nyx/tasks.db"      # SQLite database location
+
+[sandbox]
+engine = "docker-sbx"         # "docker-sbx" | "none"
+network = "restricted"        # "restricted" | "full" | "none"
+
+[output]
+dir = "~/.nyx/sessions"       # Where shift logs and summaries are written
+event_log = "~/.nyx/events.ndjson"  # NDJSON event log
+
+# Routing rules — evaluated top-to-bottom, first match wins.
+# Each route specifies match conditions, backend, endpoint, and optional fallback.
+
+[[routes]]
+match = { type = "maintenance" }
+backend = "agent-sdk"
+endpoint = "ollama/qwen2.5-coder:32b"
+fallback = "openrouter/anthropic/claude-sonnet-4-6"
+
+[[routes]]
+match = { type = "coding", priority_gte = 5 }
+backend = "claude-cli"
+endpoint = "anthropic/claude-opus-4-6"
+
+[[routes]]
+match = { type = "research" }
+backend = "agent-sdk"
+endpoint = "openrouter/anthropic/claude-sonnet-4-6"
+
+[defaults]
+backend = "agent-sdk"
+endpoint = "ollama/qwen2.5-coder:32b"
+fallback = "openrouter/anthropic/claude-sonnet-4-6"
+
+# Per-repo verification command (auto-detected if omitted).
+# verify_command = "make test"
