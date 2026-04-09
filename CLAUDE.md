@@ -6,7 +6,7 @@ Nyx is a time-bounded AI task orchestrator for overnight autonomous execution. I
 
 ## Architecture
 
-See `specs/system-architecture.md` for the full spec. Key components:
+See `specs/system-architecture.md` for the full spec. Research findings and curated links are in `specs/research/`. Key components:
 
 | Component | Location | Role |
 |-----------|----------|------|
@@ -42,6 +42,10 @@ uv run pytest                    # Run all tests
 uv run pytest tests/unit/        # Unit tests only
 uv run pytest tests/integration/ # Integration tests only
 ```
+
+## Current Milestone
+
+**Milestone 1: Core Loop (MVP)** — See `specs/MILESTONE_1.md` for the implementation checklist with dependency order. Start there.
 
 ## Key Design Principles
 

@@ -5,7 +5,9 @@ status: draft
 created: 2026-04-09
 language: Python 3.11+
 config_format: TOML
-research: "../../_PRIMARY_VAULT/AlteredCraft/Altered Craft Publications/LongFormWriting/Posts in process or complete/Night Shift AI Harness/research-findings.md"
+research:
+  findings: "./research/research-findings.md"
+  links: "./research/research-links.md"
 decisions_resolved:
   - "Language: Python (primary), flexibility for subcomponents in other languages"
   - "Name: Nyx"
@@ -306,6 +308,8 @@ interface BackendAdapter:
 Designed for incremental value — each milestone produces a usable system.
 
 ### Milestone 1: Core Loop (MVP)
+**Implementation checklist**: See [`MILESTONE_1.md`](./MILESTONE_1.md) for dependency-ordered task list and test fixtures.
+
 **Components**: Orchestrator Core, Task Queue (SQLite + CLI), Episode Runner (Claude CLI adapter only), Verification Engine (git verification only), Event Bus, Reporter (basic shift log)
 
 **What it does**: Read tasks from SQLite, run them sequentially via `claude -p --bare` in the current directory (no worktrees, no sandbox), verify via git diff, write a shift log. Wrapped in `caffeinate -s -t`.
