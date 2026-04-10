@@ -42,11 +42,26 @@ A time-bounded orchestrator that queues AI tasks, executes them autonomously via
 
 **Key behaviors**:
 - Sequential episode execution (parallel worktrees is a later milestone)
-- 8 termination conditions evaluated before each episode
+- 8 termination conditions evaluated before each episode (see below)
 - Graceful shutdown: finish current episode, write handoff, write shift log, exit cleanly
 - Checkpoint state to disk after every episode (crash recovery)
 
-**Observability**: Emits structured events for: episode_start, episode_complete, episode_error, task_selected, task_completed, task_failed, termination_triggered, budget_update, state_checkpoint.
+**Termination conditions**:
+
+| # | Condition                     | M1?  | Check                                                       |
+|---|-------------------------------|------|-------------------------------------------------------------|
+| 1 | `duration_expired`            | ✅   | Wall-clock check before each episode                        |
+| 2 | `budget_exhausted`            | ✅   | Orchestrator-local counter, checked before each episode     |
+| 3 | `queue_empty`                 | ✅   | `task_queue.next_task()` returns `None`                     |
+| 4 | `signal_received`             | ✅   | SIGINT/SIGTERM handler sets a flag; checked each loop iter  |
+| 5 | `human_stop_flag`             | stub | `~/.nyx/stop` file polled between episodes                  |
+| 6 | `consecutive_errors_exceeded` | stub | Failure counter crosses configured threshold                |
+| 7 | `backend_health_failed`       | stub | Adapter `health_check()` fails N times in a row             |
+| 8 | `catastrophic_error`          | stub | Unhandled exception in the orchestrator loop                |
+
+Stub conditions exist as enum values from day one so the type is stable; their predicates return `False` in M1 and are filled in by later milestones.
+
+**Observability**: Emits structured events for: episode_start, episode_complete, episode_error, task_selected, task_completed, task_failed, termination_triggered, budget_update, cost_unknown, state_checkpoint.
 
 ---
 
@@ -77,7 +92,7 @@ episodes
   task_id         TEXT REFERENCES tasks(id)
   episode_num     INTEGER
   model_used      TEXT
-  cost_usd        REAL
+  cost_usd        REAL               -- NULL = backend did not report cost (local models)
   duration_sec    INTEGER
   tasks_completed INTEGER            -- sub-task count completed in this episode
   exit_code       INTEGER
@@ -98,6 +113,24 @@ shift_log
 ```
 
 **Immutability enforcement**: Once a task enters `in_progress`, its `spec` field is frozen. The abstraction layer rejects mutations to spec/title on non-`todo` tasks.
+
+**State machine**:
+
+```
+Full state machine (eventual):
+  todo ──► in_progress ──► qa ──► done
+                      │          ▲
+                      ├─► blocked┘
+                      └─► failed
+
+M1 subset (enforced by the validator):
+  todo ──► in_progress ──► done
+                      └──► failed
+```
+
+M1 permits only the subset. `qa` and `blocked` exist in the enum but no M1 code path reaches them — later milestones add the transitions without schema migration.
+
+**Episode semantics**: Multiple episodes against the same task happen *within* `in_progress`. `episode_count` increments on each episode; `status` does not change until the task reaches a terminal state (`done` or `failed`). There are no backward transitions in M1 — a failed task stays failed for the session. Retry is a human action (add a new task, or a future `nyx tasks reset` command).
 
 **Observability**: Emits events for: task_created, task_status_changed, task_budget_exceeded.
 
@@ -147,7 +180,9 @@ fallback = "openrouter/anthropic/claude-sonnet-4-6"
 
 **Inputs**: Task spec, handoff (if exists), git context, model assignment, worktree path, sandbox config, episode timeout.
 
-**Outputs**: Episode result (exit code, cost, duration, handoff path, files modified).
+**Outputs**: `EpisodeResult` (exit code, `cost_usd: float | None`, duration, handoff path, files modified).
+
+When `cost_usd` is `None`, the Orchestrator emits a `cost_unknown` event and treats the episode as zero-cost for budget math — so local-model sessions still run under a budget cap without silently claiming zero spend.
 
 **Execution sequence**:
 1. Build episode prompt (mission + handoff + git context + task tracker)
@@ -162,13 +197,18 @@ fallback = "openrouter/anthropic/claude-sonnet-4-6"
 - `AgentSdkAdapter`: Invokes Anthropic Agent SDK headless, targeting configurable base URL (Ollama, OpenRouter, Anthropic direct)
 - `OpenCodeAdapter`: (future) Invokes OpenCode with agent team config
 
-Each adapter implements a common interface:
+Each adapter implements a common interface — a Python `typing.Protocol`, not an ABC:
+
+```python
+from typing import Protocol
+
+class BackendAdapter(Protocol):
+    def run(self, prompt: str, cwd: Path, timeout: int) -> EpisodeResult: ...
+    def health_check(self) -> bool: ...
+    def estimate_cost(self, prompt_tokens: int) -> float | None: ...
 ```
-interface BackendAdapter:
-    run(prompt, worktree, sandbox_config, timeout) -> EpisodeResult
-    health_check() -> bool
-    estimate_cost(prompt_tokens) -> float
-```
+
+Structural typing: adapters do not inherit. Any object with the right methods satisfies the contract, which keeps test doubles minimal and decouples adapters from a shared base class.
 
 **Observability**: Emits events for: episode_spawned, episode_stdout_line (streaming), episode_exited, episode_timeout, subprocess_error.
 
@@ -180,15 +220,29 @@ interface BackendAdapter:
 
 **Three verification stages**:
 
-1. **Handoff verification**: Cross-check HANDOFF.md claims against `git diff`. Flag truth discrepancies.
+1. **Handoff verification**: Cross-check HANDOFF.md claims against `git diff`. Missing HANDOFF.md is a contract violation and always a verification failure, regardless of git state. See the sub-failure matrix below.
 2. **Build verification**: Run the project's verification command (build, test, lint) in the worktree. Configurable per-repo via `verify_command` in config. Auto-detect from `package.json`, `Cargo.toml`, `pyproject.toml`, `go.mod` if not specified.
 3. **Policy verification**: Check blocked files weren't modified, lockfiles weren't touched, credential files weren't created.
 
-**Outputs**: VerificationResult (pass/fail per stage, details, recommended action: commit | revert | log_for_review).
+**Stage-1 sub-failure matrix** (each row is a distinct event and a parameterized test case):
 
-**On failure**: Revert the episode's changes in the worktree (`git checkout -- .` or `git stash`), increment error counter, log details.
+| Condition                                              | Event                                 | Task status                                                    |
+|--------------------------------------------------------|---------------------------------------|----------------------------------------------------------------|
+| No HANDOFF.md                                          | `handoff_missing`                     | `failed`                                                       |
+| HANDOFF.md unparseable                                 | `handoff_malformed`                   | `failed`                                                       |
+| HANDOFF.md claims files, `git diff` is empty           | `handoff_discrepancy_ghost_edits`     | `failed`                                                       |
+| `git diff` has files, HANDOFF.md doesn't mention them  | `handoff_discrepancy_unclaimed_edits` | `failed`                                                       |
+| HANDOFF.md + `git diff` both empty, `Status: done`     | `empty_episode`                       | `failed`                                                       |
+| HANDOFF.md claims match `git diff` exactly             | `handoff_verified`                    | `done` or stays `in_progress` depending on `## Status` section |
 
-**Observability**: Emits events for: verification_started, handoff_verified, handoff_discrepancy, build_passed, build_failed, policy_violation, verification_complete.
+**Outputs**: `VerificationResult` (pass/fail per stage, details, recommended action: commit | revert | log_for_review).
+
+**On failure**:
+
+- **M1 (no worktrees)**: The verification engine does *not* touch the working directory. It records the claimed-vs-actual discrepancy, captures `git status --porcelain` and `git diff --stat` snapshots into the episode record, emits the matching sub-failure event, and marks the task `failed`. Artifacts persist in the working directory for morning triage. Nyx expects to run in a clean working directory; a dirty tree at session end is a triage signal, not a bug.
+- **M3+ (worktrees)**: Revert the episode's changes in the worktree (`git checkout -- . && git clean -fd`), increment the error counter, log details. Safe because the worktree is disposable.
+
+**Observability**: Emits events for: verification_started, handoff_missing, handoff_malformed, handoff_discrepancy_ghost_edits, handoff_discrepancy_unclaimed_edits, empty_episode, handoff_verified, build_passed, build_failed, policy_violation, verification_complete.
 
 ---
 
@@ -245,7 +299,23 @@ interface BackendAdapter:
 
 **Responsibility**: Structured event logging that all components emit to and the Reporter consumes from.
 
-**Design**: Simple in-process event emitter + append-only log file (NDJSON). Not a distributed message bus — this is a single-process system.
+**Design**: Simple in-process emitter + append-only log file (NDJSON). Not a distributed message bus — this is a single-process system.
+
+**No subscribers, no callbacks.** The EventBus is append-only. It does not offer `on()` / `subscribe()` hooks. Components that need state (budget counter, consecutive-error counter) maintain that state locally and emit events as a side effect — they do not consume their own events. The Reporter reads events after the session ends; `nyx watch` tails the NDJSON file. No in-process coupling between emitters and consumers. Adding pub/sub later is trivial if a real use case appears; in M1 it would only add concurrency and error-handling complexity for zero benefit.
+
+**M1 API**:
+
+```python
+class EventBus:
+    def emit(self, component: str, event: str, *,
+             task_id: str | None = None,
+             episode: int | None = None,
+             data: dict | None = None) -> None: ...
+
+    def read_log(self) -> Iterator[dict]: ...  # Reporter + tests
+```
+
+Two modes, same API: file-backed (`EventBus(log_path=...)`) and in-memory (`EventBus()`) for tests.
 
 **Event schema**:
 ```json
@@ -265,6 +335,42 @@ interface BackendAdapter:
 - CLI (can tail the event log for real-time monitoring: `nyx watch`)
 
 **Testability**: The event log is the primary integration test artifact. Assert on event sequences to verify correct orchestration behavior without inspecting internal state.
+
+---
+
+### 3j. Handoff Format
+
+**Responsibility**: Define the contract an agent uses to communicate episode results to the next episode and to the human reviewer. HANDOFF.md is produced by the agent before exit and parsed by the Verification Engine.
+
+**M1 format — four markdown sections**:
+
+```markdown
+# Handoff: <task-id> (episode <n>)
+
+## Status
+in_progress | done
+
+## Files Modified
+- path/one
+- path/two
+
+## Summary
+<1–3 sentence narrative of what happened this episode>
+
+## Next Steps
+- <bullet list; empty if status=done>
+```
+
+**Parser contract** (forgiving but deterministic):
+
+- Case-insensitive heading match (`## files modified` == `## Files Modified`).
+- Accept `-`, `*`, or `+` as bullet markers.
+- Strip backticks and whitespace from paths; drop leading `./`.
+- Fail loudly if any required section is missing — never default. Missing sections produce a `handoff_malformed` verification event.
+
+**Rationale**: stdlib has no YAML parser; TOML frontmatter is unfamiliar. A handwritten markdown section parser is ~30 lines and trivially testable via fixtures. Markdown is also the right medium for the human morning artifact — the same file serves as the next episode's input *and* the human review surface.
+
+**Evolution**: The four-section M1 format is a floor, not a ceiling. Later milestones may add sections (e.g., `## Open Questions`, `## Test Results`, `## Risk`); the parser contract — required sections fail loudly, optional sections degrade gracefully — stays the same. Extending the format does not require a schema migration.
 
 ---
 
@@ -315,6 +421,13 @@ Designed for incremental value — each milestone produces a usable system.
 **What it does**: Read tasks from SQLite, run them sequentially via `claude -p --bare` in the current directory (no worktrees, no sandbox), verify via git diff, write a shift log. Wrapped in `caffeinate -s -t`.
 
 **Testable**: Unit tests for each component with mock interfaces. Integration test: add 3 tasks, run the loop against a test repo, assert event sequence and shift log content.
+
+**Known M1 limitations** (documented, not bugs):
+
+- **No auto-revert of failed episodes.** Run Nyx in a clean working directory; triage leftover state in the morning. Resolves at M3 (worktrees).
+- **State machine uses only `todo → in_progress → done|failed`.** The `qa` and `blocked` enum values exist but no transitions reach them yet.
+- **Only 4 of 8 termination conditions have active predicates**: `duration_expired`, `budget_exhausted`, `queue_empty`, `signal_received`. The other four are stubs.
+- **Cost tracking assumes the Claude CLI adapter** (always populates cost). Local-model support with nullable cost arrives in M2.
 
 ### Milestone 2: Multi-Model Routing
 **Components**: Model Router, Agent SDK adapter, Ollama integration
@@ -371,6 +484,7 @@ Designed for incremental value — each milestone produces a usable system.
 | **Contract** | Backend adapter compliance | Each adapter implements the `BackendAdapter` interface. Contract tests verify: spawn, capture output, timeout, health check. |
 | **End-to-end** | Real agent, real repo | Run a minimal task (e.g., "add a comment to line 1 of README.md") through the full system. Verify PR created, shift log accurate. Expensive — run sparingly. |
 | **Chaos** | Failure modes | Kill agent mid-episode (verify crash recovery). Exceed budget mid-session (verify termination). Create a task that always fails (verify error threshold). Corrupt handoff (verify discrepancy detection). |
+| **Smoke (CLI)** | CLI layer only | Thin argparse over the tested Python API. Assert `--help` exits clean; each subcommand parses args and calls the expected API function (mocked). One end-to-end CLI smoke test with a mock adapter. Full orchestration loop is *not* re-tested through the CLI. |
 
 ### Key Testability Decisions
 
@@ -378,6 +492,7 @@ Designed for incremental value — each milestone produces a usable system.
 2. **Backend adapters are the primary mock boundary**. The Episode Runner doesn't know or care whether it's talking to a real Claude instance or a test harness that returns canned responses.
 3. **SQLite is testable in-process**. Use `:memory:` databases for unit tests, temp files for integration tests. No external database process.
 4. **Git operations are testable via temp repos**. Create disposable git repos in test fixtures, run real git commands against them.
+5. **The Python API is the contract; the CLI is a UI.** All real tests drive the Python API directly. CLI tests verify only argument parsing and wiring, not orchestration behavior.
 
 ## 7. Open Decision Points
 
@@ -386,15 +501,19 @@ Designed for incremental value — each milestone produces a usable system.
 1. ~~**Programming language**~~: **Python 3.11+** (primary). Subcomponents may use other languages where appropriate. Agent SDK is native Python, SQLite/subprocess/git are stdlib.
 2. ~~**Project name**~~: **Nyx**. CLI: `nyx run`, `nyx tasks`, `nyx watch`.
 3. ~~**Config file format**~~: **TOML** (`nyx.toml`). Uses stdlib `tomllib`. Zero external deps.
-5. ~~**Agent SDK integration**~~: Native Python — no shell wrapper needed since orchestrator is Python.
+4. ~~**Agent SDK integration**~~: Native Python — no shell wrapper needed since orchestrator is Python.
+5. ~~**Handoff format**~~: **Four-section markdown** (`Status`, `Files Modified`, `Summary`, `Next Steps`). Parsed by a hand-rolled forgiving parser. See Section 3j. Evolution allowed without breaking M1.
+6. ~~**Task state machine**~~: M1 enforces the subset `todo → in_progress → done|failed`. Full enum preserved for forward compatibility. See Section 3b.
+7. ~~**Backend adapter interface style**~~: `typing.Protocol`, not ABC. Structural typing, zero-inheritance mocks. See Section 3d.
+8. ~~**Failed-episode cleanup**~~: M1 does not touch the working directory. Cleanup arrives with worktrees in M3. See Section 3e.
+9. ~~**EventBus shape**~~: Append-only log only. No pub/sub, no subscribers. See Section 3i.
 
 ### Blocking Milestone 2
 
-4. **OpenRouter vs. direct API keys**: OpenRouter simplifies multi-provider access but adds a dependency and marginal latency. Direct API keys (Anthropic, OpenAI) give full control. Can support both — but which is the default path?
+10. **OpenRouter vs. direct API keys**: OpenRouter simplifies multi-provider access but adds a dependency and marginal latency. Direct API keys (Anthropic, OpenAI) give full control. Can support both — but which is the default path?
 
 ### Non-blocking (can decide during development)
 
-6. **Handoff format**: Start with 6-section minimal (Nightcrawler-style). Evolve as needed.
-7. **Verification command auto-detection**: Nice-to-have. Start with explicit config, add detection later.
-8. **launchd integration**: Optional upgrade after caffeinate-only MVP works.
-9. **Non-coding task paths**: Vault maintenance doesn't need worktrees or sandboxing. Design the lightweight path when we get to those task types.
+11. **Verification command auto-detection**: Nice-to-have. Start with explicit config, add detection later.
+12. **launchd integration**: Optional upgrade after caffeinate-only MVP works.
+13. **Non-coding task paths**: Vault maintenance doesn't need worktrees or sandboxing. Design the lightweight path when we get to those task types.

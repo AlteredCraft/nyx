@@ -37,6 +37,8 @@ See `specs/system-architecture.md` for the full spec. Research findings and cura
 
 ## Testing
 
+Follow a strict Red-Green-Refactor TDD cycle. Write tests first, watch them fail, then implement the minimum code to make them pass. Use the `tests/` directory for all test code, organized by type
+
 ```bash
 uv run pytest                    # Run all tests
 uv run pytest tests/unit/        # Unit tests only
